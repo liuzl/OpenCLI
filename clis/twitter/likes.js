@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { auditLikesPage, prepareAuditDirectory, writeAuditPage } from './likes-audit.js';
 import { appendDurableRows, recoverLikesArchive, writeDurableCheckpoint, validateArchivePaths } from './likes-recovery.js';
 import path from 'node:path';
 import { cli, Strategy } from '@jackwener/opencli/registry';
@@ -208,6 +209,7 @@ cli({
         { name: 'all', type: 'bool', default: false, help: 'Fetch all liked-tweet pages until exhausted. Prefer --output-file for large archives.' },
         { name: 'resume-file', type: 'string', help: 'Resume file for long-running all-pages likes syncs.' },
         { name: 'output-file', type: 'string', help: 'Write all-page results to JSONL. Requires --all and --resume-file.' },
+        { name: 'audit-dir', type: 'string', help: 'Opt-in private raw page responses and parser accounting; contains personal data, never headers or cookies.' },
         { name: 'max-pages', type: 'int', help: `Optional pagination safety cap (default ${DEFAULT_MAX_PAGINATION_PAGES}; raised automatically with --all).` },
         { name: 'top-by-engagement', type: 'int', default: 0, help: 'When set to N>0, re-rank the liked tweets by weighted engagement (likes×1 + retweets×3 + replies×2 + bookmarks×5 + log10(views+1)×0.5) and return the top N. Default 0 keeps the API\'s native (recency) ordering. Incompatible with --output-file.' },
     ],
@@ -236,6 +238,8 @@ cli({
             throw new ArgumentError('--output-file requires --resume-file so partial archives remain resumable');
         }
         if (useOutputFile) validateArchivePaths(outputFile, resumeFile);
+        const auditDir = resolveOptionalFilePath(kwargs['audit-dir'], '--audit-dir');
+        if (auditDir) prepareAuditDirectory(auditDir);
         const rawUsername = String(kwargs.username ?? '').trim();
         let username = normalizeTwitterScreenName(rawUsername);
         if (rawUsername && !username) {
@@ -335,6 +339,14 @@ cli({
         const r = await fetch(${JSON.stringify(apiUrl)}, { headers: ${headers}, credentials: 'include' });
         return r.ok ? await r.json() : { error: r.status, retryAfter: r.headers.get('retry-after'), rateLimitReset: r.headers.get('x-rate-limit-reset') };
       }`));
+            if (auditDir) {
+                const probe = parseLikes(data, new Set(seen));
+                writeAuditPage(auditDir, {
+                    capturedAt: new Date().toISOString(), source: 'likes', username,
+                    request: { cursor, count: fetchCount },
+                    analysis: auditLikesPage(data, seen, probe.tweets), response: data,
+                });
+            }
             if (data?.error) {
                 httpStatus = data.error;
                 stopReason = data.error === 429 ? 'rate_limited' : 'http_error';

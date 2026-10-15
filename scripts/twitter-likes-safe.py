@@ -54,6 +54,7 @@ def main():
     parser.add_argument('username', nargs='?')
     parser.add_argument('--output-file', required=True)
     parser.add_argument('--resume-file', required=True)
+    parser.add_argument('--audit-dir', type=Path)
     parser.add_argument('--max-pages', type=int, default=1)
     args = parser.parse_args()
     if not 1 <= args.max_pages <= 100000:
@@ -78,6 +79,8 @@ def main():
         command += ['--all', '--max-pages', str(args.max_pages),
                     '--output-file', str(output), '--resume-file', str(resume),
                     '--format', 'json', '--trace', 'off']
+        if args.audit_dir:
+            command += ['--audit-dir', str(args.audit_dir.absolute())]
         # Exec retains the flock descriptors in Node. SIGKILL releases them in
         # the kernel; there is no stale PID/lease timeout or separate child left.
         os.execv(node, command)

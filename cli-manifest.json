@@ -36870,6 +36870,12 @@
         "help": "Write all-page results to JSONL. Requires --all and --resume-file."
       },
       {
+        "name": "audit-dir",
+        "type": "string",
+        "required": false,
+        "help": "Opt-in private raw page responses and parser accounting; contains personal data, never headers or cookies."
+      },
+      {
         "name": "max-pages",
         "type": "int",
         "required": false,

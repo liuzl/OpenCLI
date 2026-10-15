@@ -80,3 +80,31 @@ It tests 29 six-hour ticks, additions, absence/return, duplicate ticks, backward
 clock movement, 429 cooldown/resume, transport failures, malformed receipts and
 restart between archive publication and membership commit. It does not prove
 seven days of real browser uptime, rate-limit behavior, or observed unlikes.
+
+
+## Opt-in page reconciliation
+
+Pass `--audit-dir PRIVATE_DIRECTORY` to `twitter likes` or the safe launcher to
+save each returned response before parsing/committing it. This includes private
+post content, account metadata and cursors. The directory must be private (700);
+files are created with 600. Request headers and cookies are not captured. Never
+commit or publish these files. Capture is off by default and adds synchronous
+I/O; a failed capture stops that invocation rather than silently losing evidence.
+
+The independent auditor inventories itemContent slots across instruction shapes,
+classifies valid/duplicate/unavailable/missing/unknown results, and additionally
+searches structural Tweet objects outside the usual slot path. Quoted/retweeted
+context is not counted as separate liked memberships. Unparsed structural IDs
+are candidates for investigation, not automatic additions to the archive.
+
+After a bounded scan stops, run offline reconciliation:
+
+```sh
+node scripts/twitter-likes-audit-report.mjs --audit-dir PRIVATE_DIRECTORY \
+  --archive NEW_ARCHIVE.jsonl --baseline PREVIOUS_ARCHIVE.jsonl
+```
+
+The report prints aggregate counts only, checks cursor continuity and ID-set
+agreement, and hashes both archives. It can locate parser/storage omissions
+within captured responses; it cannot explain records that X never returned or
+prove that the profile count and timeline have the same visibility semantics.
