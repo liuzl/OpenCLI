@@ -108,3 +108,34 @@ The report prints aggregate counts only, checks cursor continuity and ID-set
 agreement, and hashes both archives. It can locate parser/storage omissions
 within captured responses; it cannot explain records that X never returned or
 prove that the profile count and timeline have the same visibility semantics.
+
+
+## New-likes mode for routine collection
+
+Historical counter equality is not required for routine research collection:
+
+```sh
+python3 scripts/twitter-likes-sync.py USERNAME --mode new-likes \
+  --state-dir PRIVATE_NEW_STATE_DIRECTORY --baseline-archive EXISTING_ARCHIVE.jsonl
+```
+
+Use a separate state directory from snapshot mode. The first run imports a
+non-empty baseline; subsequent runs use persisted state. Each due cycle starts
+at the head. It freezes the known-ID set for the entire cycle, stores all
+observed posts, and stops once the accumulated tail contains 200 consecutive
+known IDs (or all baseline IDs when fewer than 200 exist). It does not stop at
+the first known ID, or infer like time from post creation time. Partial runs and
+rate limits keep the same pending snapshot and frozen boundary. After completion,
+the next cycle starts at the head again, catching arrivals during pagination.
+
+An overlap-completed cycle returns `incremental_complete` with
+`boundary=known_overlap`; this is not API history exhaustion. New-likes mode
+never marks missing/removed memberships from a head-only scan. Known post IDs
+are deduplicated rather than creating separate records for repeated like actions.
+
+Qualification covers bursts beyond the page budget, concurrent arrivals during
+pagination, cooldown/resume, old posts newly liked, and 29 six-hour cycles with
+no full-history completion. The overlap strategy assumes X keeps recent likes
+near the head and the posts remain readable until a successful poll. It cannot
+capture a like removed or made inaccessible entirely between polls, or prove
+completeness under arbitrary server-side reordering. No OS timer is installed.

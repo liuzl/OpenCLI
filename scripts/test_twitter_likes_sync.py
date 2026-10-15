@@ -154,5 +154,103 @@ m.tick({root!r}, 'fixture', collect, 100)
                 sync.tick(root, 'another-account', collector([]), now)
 
 
+class NewLikesTest(unittest.TestCase):
+    baseline = [{'id': f'old-{n}', 'text': 'old fixture'} for n in range(300)]
+
+    def tick(self, root, collect, now, **kwargs):
+        return sync.tick(root, 'fixture', collect, now, interval=10,
+                         mode='new-likes', baseline_rows=self.baseline, **kwargs)
+
+    def test_new_posts_stop_on_known_overlap_without_reaching_history_end(self):
+        with tempfile.TemporaryDirectory() as root:
+            ids = ['new-a', 'new-b'] + [f'old-{n}' for n in range(200)]
+            result = self.tick(root, collector(ids, False, stopReason='page_cap'), 0)
+            self.assertEqual(result['status'], 'incremental_complete')
+            self.assertEqual(result['boundary'], 'known_overlap')
+            self.assertEqual(result['added'], 2)
+            self.assertEqual(state(root)['members']['old-299']['status'], 'baseline')
+            self.assertEqual(state(root)['completedSnapshots'], 0)
+
+    def test_does_not_stop_at_first_known_id_or_inadequate_overlap(self):
+        with tempfile.TemporaryDirectory() as root:
+            ids = ['old-0', 'new-a'] + [f'old-{n}' for n in range(1, 100)]
+            result = self.tick(root, collector(ids, False), 0)
+            self.assertEqual(result['status'], 'partial')
+            self.assertIn('new-a', state(root)['members'])
+            self.assertIsNotNone(state(root)['pending'])
+
+    def test_burst_larger_than_page_budget_and_arrivals_during_pagination(self):
+        with tempfile.TemporaryDirectory() as root:
+            first = [f'new-{n}' for n in range(500)]
+            paths = []
+            def start(directory):
+                paths.append(directory)
+                return collector(first, False)(directory)
+            self.assertEqual(self.tick(root, start, 0)['status'], 'partial')
+            self.assertEqual(len(state(root)['cycleKnownIds']), 300)
+            # Late arrival is inserted at the head after the first page; the
+            # continuation cursor does not show it, so the next cycle must.
+            burst = [f'new-{n}' for n in range(600)]
+            continued = burst + [f'old-{n}' for n in range(200)]
+            def resume(directory):
+                self.assertEqual(directory, paths[0])
+                return collector(continued, False)(directory)
+            result = self.tick(root, resume, 60)
+            self.assertEqual(result['status'], 'incremental_complete')
+            def next_cycle(directory):
+                self.assertNotEqual(directory, paths[0])
+                return collector(['late-arrival'] + burst[:200], False)(directory)
+            self.assertEqual(self.tick(root, next_cycle, 70)['added'], 1)
+            self.assertEqual(len(state(root)['members']), 901)
+            self.assertIsNone(state(root)['pending'])
+
+    def test_rate_limit_preserves_cycle_boundary_and_cooldown(self):
+        with tempfile.TemporaryDirectory() as root:
+            result = self.tick(root, collector(['new-a'], False, stopReason='rate_limited',
+                                              httpStatus=429, retryAfterSeconds=300), 0)
+            self.assertEqual(result['status'], 'rate_limited')
+            boundary = state(root)['cycleKnownIds']
+            self.assertNotIn('new-a', boundary)
+            def unexpected(_):
+                self.fail('Must not call during cooldown')
+            self.assertEqual(self.tick(root, unexpected, 299)['status'], 'not_due')
+            result = self.tick(root, collector(['new-a'] + boundary[:200], False), 300)
+            self.assertEqual(result['status'], 'incremental_complete')
+            self.assertEqual(result['added'], 0)  # Already stored before cooldown.
+
+    def test_new_like_on_old_post_is_not_filtered_by_post_date(self):
+        with tempfile.TemporaryDirectory() as root:
+            def collect(directory):
+                receipt = collector(['old-post-new-like'] + [f'old-{n}' for n in range(200)], False)(directory)
+                file = directory / 'archive.jsonl'
+                rows = [json.loads(line) for line in file.read_text().splitlines()]
+                rows[0]['created_at'] = 'Mon Jan 01 00:00:00 +0000 2001'
+                file.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+                return receipt
+            self.assertEqual(self.tick(root, collect, 0)['added'], 1)
+            self.assertIn('old-post-new-like', state(root)['members'])
+
+    def test_seven_days_of_new_likes_without_full_history_completion(self):
+        with tempfile.TemporaryDirectory() as root:
+            for step in range(29):
+                ids = [f'new-{n}' for n in reversed(range(step + 1))] + [f'old-{n}' for n in range(200)]
+                result = self.tick(root, collector(ids, False, stopReason='page_cap'), step * 21600)
+                self.assertEqual(result['status'], 'incremental_complete')
+                self.assertEqual(result['added'], 1)
+                self.assertEqual(self.tick(root, collector(ids, False), step * 21600)['status'], 'not_due')
+            self.assertEqual(state(root)['completedCycles'], 29)
+            self.assertEqual(state(root)['completedSnapshots'], 0)
+            self.assertEqual(len(state(root)['members']), 329)
+
+    def test_repeated_polls_and_mode_switch_are_safe(self):
+        with tempfile.TemporaryDirectory() as root:
+            ids = ['new-a'] + [f'old-{n}' for n in range(200)]
+            self.tick(root, collector(ids, False), 0)
+            self.assertEqual(self.tick(root, collector(ids, False), 10)['added'], 0)
+            self.assertEqual(len(state(root)['members']), 301)
+            with self.assertRaises(ValueError):
+                sync.tick(root, 'fixture', collector([]), 20, mode='snapshot')
+
+
 if __name__ == '__main__':
     unittest.main()
