@@ -47,6 +47,16 @@ const FEATURES = {
     responsive_web_grok_community_note_auto_translation_is_enabled: false,
     responsive_web_enhance_cards_enabled: false
 };
+function retryAfterSeconds(error, now = Date.now()) {
+    const retry = error.retryAfter;
+    const seconds = typeof retry === 'string' && retry.trim() !== '' && Number.isFinite(Number(retry))
+        ? Number(retry) : (Date.parse(retry) - now) / 1000;
+    const reset = error.rateLimitReset;
+    const resetSeconds = reset != null && String(reset).trim() !== '' && Number.isFinite(Number(reset))
+        ? Number(reset) - now / 1000 : NaN;
+    const valid = [seconds, resetSeconds].filter(value => Number.isFinite(value) && value >= 0);
+    return Math.ceil(Math.max(60, ...(valid.length ? valid : [900])));
+}
 function buildLikesUrl(queryId, userId, count, cursor) {
     const vars = {
         userId,
@@ -311,6 +321,9 @@ cli({
         let lastRawResponse = null;
         let pages = 0;
         let exhausted = false;
+        let stopReason = 'page_cap';
+        let retryDelay = null;
+        let httpStatus = null;
         // Runaway guard only; --limit/--all and cursor exhaustion control normal pagination.
         while (pages < maxPages && (fetchAll || allTweets.length < limit)) {
             pages += 1;
@@ -320,10 +333,13 @@ cli({
             const apiUrl = buildLikesUrl(likesQueryId, userId, fetchCount, cursor);
             const data = unwrapBrowserResult(await page.evaluate(`async () => {
         const r = await fetch(${JSON.stringify(apiUrl)}, { headers: ${headers}, credentials: 'include' });
-        return r.ok ? await r.json() : { error: r.status };
+        return r.ok ? await r.json() : { error: r.status, retryAfter: r.headers.get('retry-after'), rateLimitReset: r.headers.get('x-rate-limit-reset') };
       }`));
             if (data?.error) {
-                if ((useOutputFile ? outputCount : allTweets.length) === 0)
+                httpStatus = data.error;
+                stopReason = data.error === 429 ? 'rate_limited' : 'http_error';
+                if (data.error === 429) retryDelay = retryAfterSeconds(data);
+                if (!useOutputFile && allTweets.length === 0)
                     throw new CommandExecutionError(describeTwitterApiError('Likes', data.error));
                 break;
             }
@@ -366,12 +382,13 @@ cli({
             }
             if (pageComplete) {
                 exhausted = true;
+                stopReason = 'api_exhausted';
                 break;
             }
             cursor = nextCursor;
         }
         const finalCount = useOutputFile ? outputCount : allTweets.length;
-        if (finalCount === 0 && !(useOutputFile && exhausted)) {
+        if (finalCount === 0 && !(useOutputFile && (exhausted || httpStatus))) {
             if (looksLikePrivateTwitterTimeline(lastRawResponse)) {
                 throw new EmptyResultError('twitter likes', `No likes returned for @${username} (Likes are private by default on X; only the account owner can view their own likes)`);
             }
@@ -390,6 +407,7 @@ cli({
                 complete: exhausted,
                 pages,
                 recovery,
+                stopReason, httpStatus, retryAfterSeconds: retryDelay,
                 ...(exhausted ? {} : { cursor, resumeFile: resumeFile || null }),
             };
         }
@@ -404,6 +422,7 @@ cli({
     },
 });
 export const __test__ = {
+    retryAfterSeconds,
     sanitizeQueryId,
     buildLikesUrl,
     parseLikes,

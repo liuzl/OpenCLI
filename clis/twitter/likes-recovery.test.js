@@ -5,7 +5,7 @@ import { spawnSync } from 'node:child_process';
 import { describe, expect, it } from 'vitest';
 import { recoverLikesArchive, writeDurableCheckpoint, validateArchivePaths } from './likes-recovery.js';
 import { getRegistry } from '@jackwener/opencli/registry';
-import './likes.js';
+import { __test__ as likesTest } from './likes.js';
 
 function payload(ids, cursor) {
     const entries = ids.map(id => ({ entryId: `tweet-${id}`, content: { itemContent: { tweet_results: { result: {
@@ -145,6 +145,48 @@ await getRegistry().get('twitter/likes').func(pageFor(), ${JSON.stringify(args)}
             expect(result).toMatchObject({ count: 1, recoveredRows: 0, truncatedBytes: tail.length - 1 });
             expect(fs.readFileSync(f.output, 'utf8')).toBe('{"id":"1"}\n');
         } finally { fs.rmSync(f.dir, { recursive: true, force: true }); }
+    });
+
+    it('keeps the committed cursor on 429 and resumes without missing or duplicated IDs', async () => {
+        const f = fixture();
+        const args = { username: 'viewer', all: true, 'max-pages': 2, 'output-file': f.output, 'resume-file': f.resume };
+        try {
+            const page = pageFor();
+            const evaluate = page.evaluate;
+            page.evaluate = async script => {
+                if (script.includes('/Likes') && decodeURIComponent(script).includes('"cursor":"NEXT"'))
+                    return { error: 429, retryAfter: '3600' };
+                return evaluate(script);
+            };
+            const blocked = await getRegistry().get('twitter/likes').func(page, args);
+            expect(blocked).toMatchObject({ count: 2, complete: false, stopReason: 'rate_limited', retryAfterSeconds: 3600 });
+            expect(JSON.parse(fs.readFileSync(f.resume)).cursor).toBe('NEXT');
+            const recovered = await getRegistry().get('twitter/likes').func(pageFor(), args);
+            expect(recovered).toMatchObject({ count: 3, complete: true, stopReason: 'api_exhausted' });
+            expect(fs.readFileSync(f.output, 'utf8').trim().split('\n').map(JSON.parse).map(row => row.id))
+                .toEqual(['1', '2', '3']);
+        } finally { fs.rmSync(f.dir, { recursive: true, force: true }); }
+    });
+
+    it('returns a resumable rate-limit receipt even before the first row', async () => {
+        const f = fixture();
+        try {
+            const page = pageFor();
+            const evaluate = page.evaluate;
+            page.evaluate = async script => script.includes('/Likes') ? { error: 429 } : evaluate(script);
+            const result = await getRegistry().get('twitter/likes').func(page, {
+                username: 'viewer', all: true, 'output-file': f.output, 'resume-file': f.resume,
+            });
+            expect(result).toMatchObject({ count: 0, complete: false, stopReason: 'rate_limited', retryAfterSeconds: 900 });
+            expect(JSON.parse(fs.readFileSync(f.resume))).toMatchObject({ cursor: null, count: 0 });
+        } finally { fs.rmSync(f.dir, { recursive: true, force: true }); }
+    });
+
+    it('honors both retry headers, HTTP dates, and a conservative fallback', () => {
+        const now = Date.parse('2026-01-01T00:00:00Z');
+        expect(likesTest.retryAfterSeconds({ retryAfter: '120', rateLimitReset: String(now / 1000 + 300) }, now)).toBe(300);
+        expect(likesTest.retryAfterSeconds({ retryAfter: 'Thu, 01 Jan 2026 00:10:00 GMT' }, now)).toBe(600);
+        expect(likesTest.retryAfterSeconds({ retryAfter: 'invalid', rateLimitReset: '' }, now)).toBe(900);
     });
 
     it('fails closed on committed corruption, missing rows, complete-line corruption and duplicates', () => {
