@@ -182,6 +182,24 @@ await getRegistry().get('twitter/likes').func(pageFor(), ${JSON.stringify(args)}
         } finally { fs.rmSync(f.dir, { recursive: true, force: true }); }
     });
 
+    it('reports empty repeated-cursor structure without declaring completion or changing rows', async () => {
+        const f = fixture();
+        const args = { username: 'viewer', all: true, 'max-pages': 1, 'output-file': f.output, 'resume-file': f.resume };
+        try {
+            await getRegistry().get('twitter/likes').func(pageFor(), args);
+            const before = fs.readFileSync(f.output);
+            const page = pageFor();
+            const evaluate = page.evaluate;
+            const terminal = payload([], 'NEXT');
+            terminal.data.user.result.timeline_v2.timeline.instructions[0].type = 'TimelineAddEntries';
+            page.evaluate = async script => script.includes('/Likes') ? terminal : evaluate(script);
+            await expect(getRegistry().get('twitter/likes').func(page, args))
+                .rejects.toThrow('"parsedRows":0,"entries":1,"instructionTypes":["TimelineAddEntries"]');
+            expect(fs.readFileSync(f.output)).toEqual(before);
+            expect(JSON.parse(fs.readFileSync(f.resume))).toMatchObject({ count: 2, cursor: 'NEXT', complete: false });
+        } finally { fs.rmSync(f.dir, { recursive: true, force: true }); }
+    });
+
     it('honors both retry headers, HTTP dates, and a conservative fallback', () => {
         const now = Date.parse('2026-01-01T00:00:00Z');
         expect(likesTest.retryAfterSeconds({ retryAfter: '120', rateLimitReset: String(now / 1000 + 300) }, now)).toBe(300);

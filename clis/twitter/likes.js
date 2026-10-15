@@ -354,7 +354,14 @@ cli({
             }
             const { tweets, nextCursor } = parseLikes(data, seen);
             if (nextCursor && nextCursor === cursor) {
-                throw new CommandExecutionError('twitter_likes_repeated_cursor: archive completion cannot be proven; resume state was retained');
+                const instructions = data?.data?.user?.result?.timeline_v2?.timeline?.instructions
+                    || data?.data?.user?.result?.timeline?.timeline?.instructions || [];
+                const diagnostics = {
+                    parsedRows: tweets.length,
+                    entries: instructions.reduce((n, item) => n + (item.entries?.length || 0), 0),
+                    instructionTypes: instructions.map(item => String(item.type || item.__typename || 'unknown')),
+                };
+                throw new CommandExecutionError('twitter_likes_repeated_cursor: archive completion cannot be proven; resume state was retained; ' + JSON.stringify(diagnostics));
             }
             if (useOutputFile) {
                 appendDurableRows(outputFile, tweets);
