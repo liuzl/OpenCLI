@@ -1,9 +1,10 @@
 import fs from 'node:fs';
+import { appendDurableRows, recoverLikesArchive, writeDurableCheckpoint, validateArchivePaths } from './likes-recovery.js';
 import path from 'node:path';
 import { cli, Strategy } from '@jackwener/opencli/registry';
 import { ArgumentError, AuthRequiredError, CommandExecutionError, EmptyResultError } from '@jackwener/opencli/errors';
 import { buildUserByScreenNameQueryUrl, looksLikePrivateTwitterTimeline, normalizeTwitterScreenName, resolveTwitterQueryId, sanitizeQueryId, extractMedia, unwrapBrowserResult, describeTwitterApiError } from './shared.js';
-import { DEFAULT_MAX_PAGINATION_PAGES, appendJsonlRows, ensureParentDir, loadJsonlArchiveState, removeResumeFile, resolveMaxPages, resolveOptionalFilePath } from './archive.js';
+import { DEFAULT_MAX_PAGINATION_PAGES, ensureParentDir, removeResumeFile, resolveMaxPages, resolveOptionalFilePath } from './archive.js';
 import { TWITTER_BEARER_TOKEN, applyTopByEngagement } from './utils.js';
 const LIKES_QUERY_ID = 'CDWHmpZeSdIJ3HGeRbNm0w';
 const USER_BY_SCREEN_NAME_QUERY_ID = 'IGgvgiOx4QZndDHuD3x9TQ';
@@ -147,7 +148,7 @@ function readResumeFile(filePath, expected = null) {
             throw new CommandExecutionError(`Twitter likes resume file ${filePath} is missing in-memory tweets`);
         if (!expected.outputFile && parsed.tweets.length !== count)
             throw new CommandExecutionError(`Twitter likes resume file ${filePath} count does not match its in-memory tweets`);
-        if (parsed.complete)
+        if (parsed.complete && !expected.outputFile)
             throw new CommandExecutionError(`Twitter likes resume file ${filePath} is already marked complete`);
     }
     return {
@@ -159,6 +160,7 @@ function readResumeFile(filePath, expected = null) {
         source: parsed.source || null,
         outputFile,
         updatedAt: parsed.updatedAt || null,
+        ...(parsed.archive === undefined ? {} : { archive: parsed.archive }),
     };
 }
 
@@ -206,6 +208,9 @@ cli({
         const resumeFile = resolveOptionalFilePath(kwargs['resume-file'], '--resume-file');
         const outputFile = resolveOptionalFilePath(kwargs['output-file'], '--output-file');
         const useOutputFile = Boolean(fetchAll && outputFile);
+        if (outputFile && outputFile === resumeFile) {
+            throw new ArgumentError('--output-file and --resume-file must be different files');
+        }
         const maxPages = resolveMaxPages(kwargs, fetchAll);
         const topByEngagement = Number(kwargs['top-by-engagement'] || 0);
         if (useOutputFile && topByEngagement > 0) {
@@ -220,6 +225,7 @@ cli({
         if (outputFile && !resumeFile) {
             throw new ArgumentError('--output-file requires --resume-file so partial archives remain resumable');
         }
+        if (useOutputFile) validateArchivePaths(outputFile, resumeFile);
         const rawUsername = String(kwargs.username ?? '').trim();
         let username = normalizeTwitterScreenName(rawUsername);
         if (rawUsername && !username) {
@@ -280,14 +286,27 @@ cli({
             throw new ArgumentError(`Refusing to overwrite existing Twitter likes output file: ${outputFile}`);
         }
         const allTweets = useOutputFile ? [] : (resumed?.tweets ? [...resumed.tweets] : []);
-        const jsonlState = useOutputFile ? loadJsonlArchiveState(outputFile) : null;
+        const jsonlState = useOutputFile ? recoverLikesArchive(outputFile, resumed) : null;
         const seen = useOutputFile
             ? jsonlState.seen
             : new Set(allTweets.map((tweet) => tweet?.id).filter(Boolean));
-        if (useOutputFile && resumed && jsonlState.count !== resumed.count) {
-            throw new CommandExecutionError(`Twitter likes output file has ${jsonlState.count} record(s), expected resume count ${resumed.count}`);
-        }
         let outputCount = useOutputFile ? jsonlState.count : 0;
+        const recovery = useOutputFile ? {
+            recoveredRows: jsonlState.recoveredRows,
+            truncatedBytes: jsonlState.truncatedBytes,
+        } : null;
+        if (useOutputFile && resumed?.complete) {
+            return { outputFile, count: outputCount, source: 'likes', username, complete: true, pages: 0, recovery };
+        }
+        if (useOutputFile) {
+            // Persist a starting checkpoint even before the very first append.
+            // For legacy checkpoints, bind the validated bytes to a hash now.
+            writeDurableCheckpoint(resumeFile, {
+                cursor: resumed?.cursor ?? null, count: outputCount, complete: false,
+                source: 'likes', username, outputFile,
+                updatedAt: new Date().toISOString(), archive: jsonlState.archive,
+            });
+        }
         let cursor = resumed?.cursor || null;
         let lastRawResponse = null;
         let pages = 0;
@@ -318,15 +337,18 @@ cli({
                 throw new CommandExecutionError('twitter_likes_protocol_error: missing Likes timeline instructions');
             }
             const { tweets, nextCursor } = parseLikes(data, seen);
+            if (nextCursor && nextCursor === cursor) {
+                throw new CommandExecutionError('twitter_likes_repeated_cursor: archive completion cannot be proven; resume state was retained');
+            }
             if (useOutputFile) {
-                appendJsonlRows(outputFile, tweets);
+                appendDurableRows(outputFile, tweets);
                 outputCount += tweets.length;
             }
             else {
                 allTweets.push(...tweets);
             }
             const pageComplete = !nextCursor;
-            writeResumeFile(resumeFile, {
+            const pageCheckpoint = {
                 cursor: pageComplete ? null : nextCursor,
                 count: useOutputFile ? outputCount : allTweets.length,
                 tweets: useOutputFile ? undefined : allTweets,
@@ -335,27 +357,29 @@ cli({
                 source: 'likes',
                 username,
                 outputFile: useOutputFile ? outputFile : null,
-            });
+            };
+            if (useOutputFile) {
+                const state = recoverLikesArchive(outputFile, { count: outputCount });
+                writeDurableCheckpoint(resumeFile, { ...pageCheckpoint, archive: state.archive });
+            } else {
+                writeResumeFile(resumeFile, pageCheckpoint);
+            }
             if (pageComplete) {
                 exhausted = true;
                 break;
             }
-            if (nextCursor === cursor) {
-                throw new CommandExecutionError('twitter_likes_repeated_cursor: archive completion cannot be proven; resume state was retained');
-            }
             cursor = nextCursor;
         }
         const finalCount = useOutputFile ? outputCount : allTweets.length;
-        if (finalCount === 0) {
+        if (finalCount === 0 && !(useOutputFile && exhausted)) {
             if (looksLikePrivateTwitterTimeline(lastRawResponse)) {
                 throw new EmptyResultError('twitter likes', `No likes returned for @${username} (Likes are private by default on X; only the account owner can view their own likes)`);
             }
             throw new EmptyResultError('twitter likes', `No likes found for @${username}`);
         }
-        // Resume is only removed after the timeline is truly exhausted. Hitting
-        // --max-pages, partial API errors after some rows, or an interrupt must
-        // leave the resume file so the next run can continue.
-        if (exhausted)
+        // File archives retain terminal checkpoints for idempotent retries.
+        // In-memory mode keeps its original remove-on-completion behavior.
+        if (exhausted && !useOutputFile)
             removeResumeFile(resumeFile);
         if (useOutputFile) {
             return {
@@ -365,6 +389,7 @@ cli({
                 username,
                 complete: exhausted,
                 pages,
+                recovery,
                 ...(exhausted ? {} : { cursor, resumeFile: resumeFile || null }),
             };
         }

@@ -222,7 +222,7 @@ describe('twitter likes archive safety', () => {
         }
     });
 
-    it('rejects output files whose JSONL record count differs from resume state', async () => {
+    it('recovers complete records beyond a legacy checkpoint without duplicates', async () => {
         const command = getRegistry().get('twitter/likes');
         const outputFile = `/tmp/opencli-likes-count-mismatch-${process.pid}-${Date.now()}.jsonl`;
         const resumeFile = `${outputFile}.resume.json`;
@@ -236,12 +236,12 @@ describe('twitter likes archive safety', () => {
             outputFile,
         }));
         try {
-            await expect(command.func(pageFor(), {
-                username: 'viewer',
-                all: true,
-                'output-file': outputFile,
-                'resume-file': resumeFile,
-            })).rejects.toThrow(/expected resume count 1/);
+            const result = await command.func(pageFor(), {
+                username: 'viewer', all: true,
+                'output-file': outputFile, 'resume-file': resumeFile,
+            });
+            expect(result).toMatchObject({ count: 2, complete: true, recovery: { recoveredRows: 1 } });
+            expect(fs.readFileSync(outputFile, 'utf8').trim().split('\n')).toHaveLength(2);
         }
         finally {
             fs.rmSync(outputFile, { force: true });
@@ -423,7 +423,7 @@ describe('twitter likes command', () => {
         }
     });
 
-    it('removes resume file only after the likes timeline is exhausted', async () => {
+    it('retains a completed file checkpoint and returns an idempotent receipt', async () => {
         const command = getRegistry().get('twitter/likes');
         const resumeFile = `/tmp/opencli-likes-resume-done-${process.pid}-${Date.now()}.json`;
         const outputFile = `/tmp/opencli-likes-out-done-${process.pid}-${Date.now()}.jsonl`;
@@ -464,8 +464,12 @@ describe('twitter likes command', () => {
                 pages: 1,
             });
             expect(result.cursor).toBeUndefined();
-            expect(fs.existsSync(resumeFile)).toBe(false);
+            expect(fs.existsSync(resumeFile)).toBe(true);
             expect(fs.existsSync(outputFile)).toBe(true);
+            const again = await command.func(page, {
+                all: true, 'max-pages': 1, 'resume-file': resumeFile, 'output-file': outputFile,
+            });
+            expect(again).toMatchObject({ complete: true, count: 1, pages: 0 });
         }
         finally {
             fs.rmSync(resumeFile, { force: true });
